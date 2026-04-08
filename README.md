@@ -11,6 +11,8 @@ It focuses on a gap between:
 The first release is intentionally small:
 
 - stdio transport
+- `streamable-http` transport in JSON response mode
+- custom HTTP headers for remote servers
 - JSON scenario files
 - repeated `tools/call` execution
 - scenario-level reliability budgets
@@ -47,6 +49,25 @@ PYTHONPATH=src python3 -m mcp_smoke.cli \
   --json-out /tmp/mcp-smoke-report.json \
   -- python3 examples/echo_server.py
 ```
+
+### Remote `streamable-http`
+
+`mcp-smoke` can also exercise a remote MCP endpoint in JSON response mode:
+
+```bash
+PYTHONPATH=src python3 -m mcp_smoke.cli \
+  --transport streamable-http \
+  --url http://127.0.0.1:8080/mcp \
+  --header Authorization="Bearer test-token" \
+  --scenario examples/http_echo_scenario.json
+```
+
+Current remote scope is intentionally narrow:
+
+- supports `streamable-http`
+- supports request headers
+- expects JSON request/response flow
+- does **not** implement SSE event-stream handling in this version
 
 ## Scenario format
 
@@ -123,7 +144,7 @@ The JSON report contains:
 ## Roadmap
 
 - scenario ergonomics for more real-world reliability checks
-- SSE transport if remote-server demand shows up
+- fuller remote transport coverage only if clear demand shows up
 - packaged GitHub Action wrapper after the reliability thesis is sharper
 
 ## License

@@ -1,0 +1,16 @@
+{
+  "name": "http-echo",
+  "expected_tools": ["http_echo"],
+  "calls": [
+    {
+      "tool": "http_echo",
+      "arguments": {
+        "text": "hello-http"
+      },
+      "expect": {
+        "path": "structuredContent.echo",
+        "equals": "hello-http"
+      }
+    }
+  ]
+}

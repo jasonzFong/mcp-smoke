@@ -9,12 +9,24 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib import error, request
 
 
 PROTOCOL_VERSION = "2025-06-18"
 
 
-class McpClient:
+class BaseMcpClient:
+    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return
+
+
+class StdioMcpClient(BaseMcpClient):
     def __init__(self, command: list[str], timeout: float) -> None:
         self._timeout = timeout
         self._next_id = 0
@@ -79,6 +91,67 @@ class McpClient:
         self._proc.stdin.flush()
 
 
+class StreamableHttpMcpClient(BaseMcpClient):
+    def __init__(self, url: str, timeout: float, headers: dict[str, str] | None = None) -> None:
+        self._url = url
+        self._timeout = timeout
+        self._headers = headers or {}
+        self._next_id = 0
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        http_request = request.Request(
+            self._url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                **self._headers,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=self._timeout) as response:
+                raw_body = response.read()
+        except error.HTTPError as exc:
+            raw_body = exc.read()
+            detail = raw_body.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"HTTP {exc.code}: {detail or exc.reason}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"HTTP transport error: {exc.reason}") from exc
+
+        if not raw_body:
+            return {}
+        return json.loads(raw_body.decode("utf-8"))
+
+    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._next_id += 1
+        request_id = self._next_id
+        response = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params or {},
+            }
+        )
+        if response.get("id") != request_id:
+            raise RuntimeError(f"unexpected response id for {method}")
+        if "error" in response:
+            error_payload = response["error"]
+            raise RuntimeError(error_payload.get("message", "unknown MCP error"))
+        return response.get("result", {})
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        self._post(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params or {},
+            }
+        )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run smoke scenarios against an MCP server.")
     parser.add_argument("--scenario", required=True, help="Path to a JSON scenario file")
@@ -86,6 +159,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1, help="Number of times to repeat each tool call")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero on any failure")
     parser.add_argument("--timeout", type=float, default=5.0, help="Per-request timeout in seconds")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="Transport type to use.",
+    )
+    parser.add_argument("--url", help="Remote MCP endpoint URL for streamable-http transport")
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help="Additional HTTP header in KEY=VALUE format. Repeatable.",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Server command after --")
     return parser.parse_args(argv)
 
@@ -173,12 +259,25 @@ def run(argv: list[str] | None = None) -> int:
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
-    if not command:
+    if args.transport == "stdio" and not command:
         print("missing server command", file=sys.stderr)
+        return 2
+    if args.transport == "streamable-http" and not args.url:
+        print("missing --url for streamable-http transport", file=sys.stderr)
         return 2
 
     scenario = load_scenario(Path(args.scenario))
-    client = McpClient(command=command, timeout=args.timeout)
+    if args.transport == "stdio":
+        client: BaseMcpClient = StdioMcpClient(command=command, timeout=args.timeout)
+    else:
+        headers: dict[str, str] = {}
+        for item in args.header:
+            if "=" not in item:
+                print(f"invalid --header value: {item}", file=sys.stderr)
+                return 2
+            key, value = item.split("=", 1)
+            headers[key] = value
+        client = StreamableHttpMcpClient(url=args.url, timeout=args.timeout, headers=headers)
 
     results: list[dict[str, Any]] = []
     errors: list[str] = []

@@ -1,4 +1,6 @@
+import http.server
 import json
+import threading
 import subprocess
 import sys
 import tempfile
@@ -8,6 +10,103 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHONPATH = str(ROOT / "src")
+
+
+class _HttpFixtureHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "mcp-smoke-fixture/0.1"
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:  # noqa: N802
+        content_length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        response: dict[str, object]
+
+        if self.headers.get("Authorization") != "Bearer test-token":
+            response = {
+                "jsonrpc": "2.0",
+                "id": payload.get("id"),
+                "error": {"code": -32001, "message": "missing authorization header"},
+            }
+        else:
+            method = payload.get("method")
+            if method == "initialize":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {
+                        "protocolVersion": payload["params"]["protocolVersion"],
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {"name": "http-echo", "version": "0.1.0"},
+                    },
+                }
+            elif method == "tools/list":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "http_echo",
+                                "description": "Echo via streamable HTTP",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"text": {"type": "string"}},
+                                    "required": ["text"],
+                                },
+                            }
+                        ]
+                    },
+                }
+            elif method == "tools/call":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": payload["params"]["arguments"].get("text", ""),
+                            }
+                        ],
+                        "structuredContent": {
+                            "echo": payload["params"]["arguments"].get("text", ""),
+                            "auth": self.headers.get("Authorization"),
+                        },
+                        "isError": False,
+                    },
+                }
+            else:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {},
+                }
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+
+class _HttpFixtureServer:
+    def __init__(self) -> None:
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HttpFixtureHandler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/mcp"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> "_HttpFixtureServer":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
 
 
 class CliTests(unittest.TestCase):
@@ -149,6 +248,40 @@ class CliTests(unittest.TestCase):
         self.assertEqual(tool_stats["success_rate"], 0.5)
         self.assertIn("latency_p95_ms", tool_stats)
         self.assertIn("failure_patterns", report)
+
+    def test_streamable_http_transport_supports_remote_server_and_headers(self) -> None:
+        report_dir = Path(tempfile.mkdtemp())
+        report_path = report_dir / "report.json"
+        with _HttpFixtureServer() as fixture:
+            cmd = [
+                sys.executable,
+                "-m",
+                "mcp_smoke.cli",
+                "--transport",
+                "streamable-http",
+                "--url",
+                fixture.url,
+                "--header",
+                "Authorization=Bearer test-token",
+                "--scenario",
+                str(ROOT / "examples" / "http_echo_scenario.json"),
+                "--json-out",
+                str(report_path),
+            ]
+            env = dict(PYTHONPATH=PYTHONPATH, **{})
+            result = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=15,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report["summary"]["success_rate"], 1.0)
+        self.assertEqual(report["tools"]["http_echo"]["successful_calls"], 1)
 
 
 if __name__ == "__main__":

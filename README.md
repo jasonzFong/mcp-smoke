@@ -17,6 +17,7 @@ The first release is intentionally small:
 - repeated `tools/call` execution
 - scenario-level reliability budgets
 - per-tool reliability aggregates
+- failure-mode classification
 - grouped failure-pattern reporting
 - readable terminal summary
 - JSON report output
@@ -125,6 +126,8 @@ Terminal output includes:
 
 - verdict
 - success rate
+- budget pass/fail status
+- failure-mode summary
 - overall and per-tool call counts
 - overall and per-tool latency summaries
 - grouped failure patterns
@@ -134,12 +137,22 @@ The JSON report contains:
 
 - `summary.verdict`
 - `summary.success_rate`
+- `summary.budget_passed`
 - `summary.latency_p50_ms`
 - `summary.latency_p95_ms`
+- `failure_modes[]`
 - `tools.<tool>.success_rate`
 - `failure_patterns[]`
 - per-call results
 - error list
+
+Current failure-mode categories include:
+
+- `missing_expected_tool`
+- `expectation_mismatch`
+- `setup_failure`
+- `timeout`
+- `tool_call_failure`
 
 ## Roadmap
 

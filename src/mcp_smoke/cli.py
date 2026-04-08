@@ -230,6 +230,10 @@ def format_summary(report: dict[str, Any]) -> str:
     ]
     if "budget_passed" in summary:
         lines.append(f"budget_passed: {summary['budget_passed']}")
+    if report.get("failure_modes"):
+        lines.append("failure_modes:")
+        for failure_mode in report["failure_modes"]:
+            lines.append(f"- {failure_mode['category']} x{failure_mode['count']}")
     for tool_name, stats in report.get("tools", {}).items():
         lines.append(
             f"{tool_name}: {stats['successful_calls']}/{stats['total_calls']} "
@@ -252,6 +256,14 @@ def format_summary(report: dict[str, Any]) -> str:
         for error in report["errors"]:
             lines.append(f"- {error}")
     return "\n".join(lines)
+
+
+def classify_exception(exc: Exception, stage: str) -> str:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if stage in {"initialize", "notifications/initialized", "tools/list"}:
+        return "setup_failure"
+    return "tool_call_failure"
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -282,68 +294,98 @@ def run(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     violations: list[str] = []
+    failure_events: list[dict[str, str]] = []
     successful_calls = 0
     total_calls = 0
 
     try:
-        client.request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"roots": {"listChanged": False}, "sampling": {}},
-                "clientInfo": {"name": "mcp-smoke", "version": "0.1.0"},
-            },
-        )
-        client.notify("notifications/initialized")
-        tools_result = client.request("tools/list")
-        tools = tools_result.get("tools", [])
-        tool_names = {tool["name"] for tool in tools}
+        try:
+            client.request(
+                "initialize",
+                {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {"roots": {"listChanged": False}, "sampling": {}},
+                    "clientInfo": {"name": "mcp-smoke", "version": "0.1.0"},
+                },
+            )
+            client.notify("notifications/initialized")
+            tools_result = client.request("tools/list")
+        except Exception as exc:  # noqa: BLE001
+            category = classify_exception(exc, "initialize")
+            message = str(exc)
+            errors.append(message)
+            failure_events.append({"category": category, "message": message})
+            tools_result = {"tools": []}
+        else:
+            tools = tools_result.get("tools", [])
+            tool_names = {tool["name"] for tool in tools}
 
-        for expected_tool in scenario.get("expected_tools", []):
-            if expected_tool not in tool_names:
-                message = f"missing expected tool: {expected_tool}"
-                errors.append(message)
-                violations.append(message)
-
-        for call in scenario["calls"]:
-            for _ in range(args.repeat):
-                total_calls += 1
-                started_at = time.perf_counter()
-                status = "pass"
-                detail = ""
-                try:
-                    result = client.request(
-                        "tools/call",
+            for expected_tool in scenario.get("expected_tools", []):
+                if expected_tool not in tool_names:
+                    message = f"missing expected tool: {expected_tool}"
+                    errors.append(message)
+                    violations.append(message)
+                    failure_events.append(
                         {
-                            "name": call["tool"],
-                            "arguments": call.get("arguments", {}),
-                        },
+                            "category": "missing_expected_tool",
+                            "message": message,
+                        }
                     )
-                    expectation = call.get("expect")
-                    if expectation:
-                        actual = get_by_path(result, expectation["path"])
-                        if actual != expectation["equals"]:
-                            status = "fail"
-                            detail = f"expected {expectation['path']}={expectation['equals']!r}, got {actual!r}"
-                            violations.append(f"{call['tool']}: {detail}")
+
+            for call in scenario["calls"]:
+                for _ in range(args.repeat):
+                    total_calls += 1
+                    started_at = time.perf_counter()
+                    status = "pass"
+                    detail = ""
+                    try:
+                        result = client.request(
+                            "tools/call",
+                            {
+                                "name": call["tool"],
+                                "arguments": call.get("arguments", {}),
+                            },
+                        )
+                        expectation = call.get("expect")
+                        if expectation:
+                            actual = get_by_path(result, expectation["path"])
+                            if actual != expectation["equals"]:
+                                status = "fail"
+                                detail = (
+                                    f"expected {expectation['path']}={expectation['equals']!r}, "
+                                    f"got {actual!r}"
+                                )
+                                violations.append(f"{call['tool']}: {detail}")
+                                failure_events.append(
+                                    {
+                                        "category": "expectation_mismatch",
+                                        "message": f"{call['tool']}: {detail}",
+                                    }
+                                )
+                            else:
+                                successful_calls += 1
                         else:
                             successful_calls += 1
-                    else:
-                        successful_calls += 1
-                except Exception as exc:  # noqa: BLE001
-                    status = "fail"
-                    detail = str(exc)
-                latency_ms = (time.perf_counter() - started_at) * 1000
-                if status == "fail":
-                    errors.append(f"{call['tool']}: {detail}")
-                results.append(
-                    {
-                        "tool": call["tool"],
-                        "status": status,
-                        "detail": detail,
-                        "latency_ms": latency_ms,
-                    }
-                )
+                    except Exception as exc:  # noqa: BLE001
+                        status = "fail"
+                        detail = str(exc)
+                        failure_events.append(
+                            {
+                                "category": classify_exception(exc, "tools/call"),
+                                "message": f"{call['tool']}: {detail}",
+                            }
+                        )
+                    latency_ms = (time.perf_counter() - started_at) * 1000
+                    if status == "fail":
+                        errors.append(f"{call['tool']}: {detail}")
+                    results.append(
+                        {
+                            "tool": call["tool"],
+                            "status": status,
+                            "detail": detail,
+                            "latency_ms": latency_ms,
+                        }
+                    )
     finally:
         client.close()
 
@@ -384,6 +426,19 @@ def run(argv: list[str] | None = None) -> int:
         )
     ]
 
+    failure_mode_counts: dict[str, int] = {}
+    for item in failure_events:
+        category = item["category"]
+        failure_mode_counts[category] = failure_mode_counts.get(category, 0) + 1
+
+    failure_modes = [
+        {"category": category, "count": count}
+        for category, count in sorted(
+            failure_mode_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
     reliability = scenario.get("reliability", {})
     if "min_success_rate" in reliability and success_rate < reliability["min_success_rate"]:
         violations.append(
@@ -398,7 +453,7 @@ def run(argv: list[str] | None = None) -> int:
             f"latency p95 {latency_p95:.1f} ms above maximum {reliability['max_p95_ms']:.1f} ms"
         )
 
-    budget_passed = True if not reliability else len(violations) == 0
+    budget_passed = len(errors) == 0 if not reliability else len(violations) == 0
     hard_failures = len(violations) if reliability else len(errors)
     report = {
         "scenario": scenario.get("name", Path(args.scenario).stem),
@@ -412,6 +467,7 @@ def run(argv: list[str] | None = None) -> int:
             "budget_passed": budget_passed,
         },
         "tools": tool_stats,
+        "failure_modes": failure_modes,
         "failure_patterns": failure_patterns,
         "results": results,
         "errors": errors,

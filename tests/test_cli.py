@@ -79,6 +79,77 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["summary"]["verdict"], "trustworthy")
         self.assertEqual(report["summary"]["success_rate"], 1.0)
 
+    def test_reliability_budget_failure_is_reported_in_strict_mode(self) -> None:
+        report_dir = Path(tempfile.mkdtemp())
+        report_path = report_dir / "report.json"
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp_smoke.cli",
+            "--scenario",
+            str(ROOT / "examples" / "flaky_budget_fail.json"),
+            "--json-out",
+            str(report_path),
+            "--repeat",
+            "4",
+            "--strict",
+            "--",
+            sys.executable,
+            str(ROOT / "examples" / "flaky_server.py"),
+        ]
+        env = dict(PYTHONPATH=PYTHONPATH, **{})
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report["summary"]["success_rate"], 0.5)
+        self.assertEqual(report["summary"]["verdict"], "untrusted")
+        self.assertFalse(report["summary"]["budget_passed"])
+        self.assertIn("failure_patterns", report)
+        self.assertEqual(report["failure_patterns"][0]["count"], 2)
+
+    def test_reliability_budget_pass_outputs_tool_aggregate_stats(self) -> None:
+        report_dir = Path(tempfile.mkdtemp())
+        report_path = report_dir / "report.json"
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp_smoke.cli",
+            "--scenario",
+            str(ROOT / "examples" / "flaky_budget_pass.json"),
+            "--json-out",
+            str(report_path),
+            "--repeat",
+            "4",
+            "--",
+            sys.executable,
+            str(ROOT / "examples" / "flaky_server.py"),
+        ]
+        env = dict(PYTHONPATH=PYTHONPATH, **{})
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["summary"]["budget_passed"])
+        tool_stats = report["tools"]["flaky_echo"]
+        self.assertEqual(tool_stats["total_calls"], 4)
+        self.assertEqual(tool_stats["successful_calls"], 2)
+        self.assertEqual(tool_stats["success_rate"], 0.5)
+        self.assertIn("latency_p95_ms", tool_stats)
+        self.assertIn("failure_patterns", report)
+
 
 if __name__ == "__main__":
     unittest.main()

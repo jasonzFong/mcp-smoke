@@ -1,0 +1,19 @@
+{
+  "name": "flaky-budget-pass",
+  "expected_tools": ["flaky_echo"],
+  "reliability": {
+    "min_success_rate": 0.5
+  },
+  "calls": [
+    {
+      "tool": "flaky_echo",
+      "arguments": {
+        "text": "hello"
+      },
+      "expect": {
+        "path": "structuredContent.echo",
+        "equals": "hello"
+      }
+    }
+  ]
+}

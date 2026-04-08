@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import statistics
 import subprocess
@@ -106,6 +107,22 @@ def get_by_path(value: Any, dotted_path: str) -> Any:
     return current
 
 
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * pct
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[lower]
+    lower_value = ordered[lower]
+    upper_value = ordered[upper]
+    return lower_value + (upper_value - lower_value) * (rank - lower)
+
+
 def verdict_for(success_rate: float, hard_failures: int) -> str:
     if hard_failures > 0:
         return "untrusted"
@@ -122,11 +139,28 @@ def format_summary(report: dict[str, Any]) -> str:
         f"verdict: {summary['verdict']}",
         f"success_rate: {summary['success_rate']:.2f}",
         f"calls: {summary['successful_calls']}/{summary['total_calls']}",
+        f"latency_p50_ms: {summary['latency_p50_ms']:.1f}",
+        f"latency_p95_ms: {summary['latency_p95_ms']:.1f}",
     ]
+    if "budget_passed" in summary:
+        lines.append(f"budget_passed: {summary['budget_passed']}")
+    for tool_name, stats in report.get("tools", {}).items():
+        lines.append(
+            f"{tool_name}: {stats['successful_calls']}/{stats['total_calls']} "
+            f"success ({stats['success_rate']:.2f}), p95 {stats['latency_p95_ms']:.1f} ms"
+        )
     for item in report["results"]:
         lines.append(
             f"{item['tool']}: {item['status']} ({item['latency_ms']:.1f} ms)"
         )
+    if report.get("failure_patterns"):
+        lines.append("failure_patterns:")
+        for pattern in report["failure_patterns"]:
+            lines.append(f"- {pattern['tool']}: {pattern['message']} x{pattern['count']}")
+    if report.get("violations"):
+        lines.append("violations:")
+        for violation in report["violations"]:
+            lines.append(f"- {violation}")
     if report["errors"]:
         lines.append("errors:")
         for error in report["errors"]:
@@ -148,6 +182,7 @@ def run(argv: list[str] | None = None) -> int:
 
     results: list[dict[str, Any]] = []
     errors: list[str] = []
+    violations: list[str] = []
     successful_calls = 0
     total_calls = 0
 
@@ -167,7 +202,9 @@ def run(argv: list[str] | None = None) -> int:
 
         for expected_tool in scenario.get("expected_tools", []):
             if expected_tool not in tool_names:
-                errors.append(f"missing expected tool: {expected_tool}")
+                message = f"missing expected tool: {expected_tool}"
+                errors.append(message)
+                violations.append(message)
 
         for call in scenario["calls"]:
             for _ in range(args.repeat):
@@ -189,6 +226,7 @@ def run(argv: list[str] | None = None) -> int:
                         if actual != expectation["equals"]:
                             status = "fail"
                             detail = f"expected {expectation['path']}={expectation['equals']!r}, got {actual!r}"
+                            violations.append(f"{call['tool']}: {detail}")
                         else:
                             successful_calls += 1
                     else:
@@ -211,9 +249,58 @@ def run(argv: list[str] | None = None) -> int:
         client.close()
 
     success_rate = 0.0 if total_calls == 0 else successful_calls / total_calls
-    hard_failures = len(errors)
     latencies = [item["latency_ms"] for item in results]
     latency_p50 = statistics.median(latencies) if latencies else 0.0
+    latency_p95 = percentile(latencies, 0.95)
+
+    tool_buckets: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        tool_buckets.setdefault(item["tool"], []).append(item)
+
+    tool_stats: dict[str, dict[str, Any]] = {}
+    for tool_name, tool_results in tool_buckets.items():
+        tool_latencies = [item["latency_ms"] for item in tool_results]
+        tool_successes = sum(1 for item in tool_results if item["status"] == "pass")
+        tool_total = len(tool_results)
+        tool_stats[tool_name] = {
+            "total_calls": tool_total,
+            "successful_calls": tool_successes,
+            "success_rate": 0.0 if tool_total == 0 else tool_successes / tool_total,
+            "latency_p50_ms": statistics.median(tool_latencies) if tool_latencies else 0.0,
+            "latency_p95_ms": percentile(tool_latencies, 0.95),
+        }
+
+    failure_pattern_counts: dict[tuple[str, str], int] = {}
+    for item in results:
+        if item["status"] != "fail":
+            continue
+        key = (item["tool"], item["detail"])
+        failure_pattern_counts[key] = failure_pattern_counts.get(key, 0) + 1
+
+    failure_patterns = [
+        {"tool": tool, "message": message, "count": count}
+        for (tool, message), count in sorted(
+            failure_pattern_counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        )
+    ]
+
+    reliability = scenario.get("reliability", {})
+    if "min_success_rate" in reliability and success_rate < reliability["min_success_rate"]:
+        violations.append(
+            f"success rate {success_rate:.2f} below minimum {reliability['min_success_rate']:.2f}"
+        )
+    if "max_p50_ms" in reliability and latency_p50 > reliability["max_p50_ms"]:
+        violations.append(
+            f"latency p50 {latency_p50:.1f} ms above maximum {reliability['max_p50_ms']:.1f} ms"
+        )
+    if "max_p95_ms" in reliability and latency_p95 > reliability["max_p95_ms"]:
+        violations.append(
+            f"latency p95 {latency_p95:.1f} ms above maximum {reliability['max_p95_ms']:.1f} ms"
+        )
+
+    budget_passed = True if not reliability else len(violations) == 0
+    hard_failures = len(violations) if reliability else len(errors)
     report = {
         "scenario": scenario.get("name", Path(args.scenario).stem),
         "summary": {
@@ -222,16 +309,22 @@ def run(argv: list[str] | None = None) -> int:
             "total_calls": total_calls,
             "successful_calls": successful_calls,
             "latency_p50_ms": latency_p50,
+            "latency_p95_ms": latency_p95,
+            "budget_passed": budget_passed,
         },
+        "tools": tool_stats,
+        "failure_patterns": failure_patterns,
         "results": results,
         "errors": errors,
+        "violations": violations,
     }
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
 
     print(format_summary(report))
-    if args.strict and errors:
+    strict_failures = violations if reliability else errors
+    if args.strict and strict_failures:
         return 1
     return 0
 

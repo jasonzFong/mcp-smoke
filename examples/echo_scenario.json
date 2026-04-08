@@ -1,0 +1,16 @@
+{
+  "name": "echo-happy-path",
+  "expected_tools": ["echo"],
+  "calls": [
+    {
+      "tool": "echo",
+      "arguments": {
+        "text": "hello"
+      },
+      "expect": {
+        "path": "structuredContent.echo",
+        "equals": "hello"
+      }
+    }
+  ]
+}

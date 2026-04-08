@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-smoke"
+version = "0.1.0"
+description = "Replay smoke scenarios against MCP servers and emit a reliability verdict."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "jasonzFong" }
+]
+dependencies = []
+
+[project.scripts]
+mcp-smoke = "mcp_smoke.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

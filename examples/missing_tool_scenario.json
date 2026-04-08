@@ -1,0 +1,16 @@
+{
+  "name": "missing-tool",
+  "expected_tools": ["echo", "missing_tool"],
+  "calls": [
+    {
+      "tool": "echo",
+      "arguments": {
+        "text": "hello"
+      },
+      "expect": {
+        "path": "structuredContent.echo",
+        "equals": "hello"
+      }
+    }
+  ]
+}

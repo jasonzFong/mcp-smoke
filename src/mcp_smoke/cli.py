@@ -13,6 +13,9 @@ from urllib import error, request
 
 
 PROTOCOL_VERSION = "2025-06-18"
+LATENCY_REGRESSION_GRACE_MS = 5.0
+SUCCESS_RATE_EPSILON = 0.001
+VERDICT_RANK = {"untrusted": 0, "caution": 1, "trustworthy": 2}
 
 
 class BaseMcpClient:
@@ -156,6 +159,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run smoke scenarios against an MCP server.")
     parser.add_argument("--scenario", required=True, help="Path to a JSON scenario file")
     parser.add_argument("--json-out", help="Optional path to write a JSON report")
+    parser.add_argument("--baseline", help="Optional JSON report from a previous run")
+    parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="Exit non-zero when the current run regresses against --baseline",
+    )
     parser.add_argument("--repeat", type=int, default=1, help="Number of times to repeat each tool call")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero on any failure")
     parser.add_argument("--timeout", type=float, default=5.0, help="Per-request timeout in seconds")
@@ -181,6 +190,10 @@ def load_scenario(path: Path) -> dict[str, Any]:
     if "calls" not in scenario or not isinstance(scenario["calls"], list):
         raise ValueError("scenario must contain a calls array")
     return scenario
+
+
+def load_report(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
 
 
 def get_by_path(value: Any, dotted_path: str) -> Any:
@@ -219,6 +232,80 @@ def verdict_for(success_rate: float, hard_failures: int) -> str:
     return "untrusted"
 
 
+def compare_reports(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    current_summary = current["summary"]
+    baseline_summary = baseline.get("summary", {})
+    regressions: list[str] = []
+    improvements: list[str] = []
+
+    current_verdict = current_summary.get("verdict", "untrusted")
+    baseline_verdict = baseline_summary.get("verdict", "untrusted")
+    current_rank = VERDICT_RANK.get(current_verdict, 0)
+    baseline_rank = VERDICT_RANK.get(baseline_verdict, 0)
+    if current_rank < baseline_rank:
+        regressions.append(f"verdict regressed from {baseline_verdict} to {current_verdict}")
+    elif current_rank > baseline_rank:
+        improvements.append(f"verdict improved from {baseline_verdict} to {current_verdict}")
+
+    current_budget = bool(current_summary.get("budget_passed", False))
+    baseline_budget = bool(baseline_summary.get("budget_passed", False))
+    if baseline_budget and not current_budget:
+        regressions.append("reliability budget changed from passing to failing")
+    elif current_budget and not baseline_budget:
+        improvements.append("reliability budget changed from failing to passing")
+
+    current_success_rate = float(current_summary.get("success_rate", 0.0))
+    baseline_success_rate = float(baseline_summary.get("success_rate", 0.0))
+    if current_success_rate + SUCCESS_RATE_EPSILON < baseline_success_rate:
+        regressions.append(
+            f"success rate regressed from {baseline_success_rate:.2f} to {current_success_rate:.2f}"
+        )
+    elif baseline_success_rate + SUCCESS_RATE_EPSILON < current_success_rate:
+        improvements.append(
+            f"success rate improved from {baseline_success_rate:.2f} to {current_success_rate:.2f}"
+        )
+
+    current_p95 = float(current_summary.get("latency_p95_ms", 0.0))
+    baseline_p95 = float(baseline_summary.get("latency_p95_ms", 0.0))
+    if current_p95 > baseline_p95 + LATENCY_REGRESSION_GRACE_MS:
+        regressions.append(
+            f"latency p95 regressed from {baseline_p95:.1f} ms to {current_p95:.1f} ms"
+        )
+    elif baseline_p95 > current_p95 + LATENCY_REGRESSION_GRACE_MS:
+        improvements.append(
+            f"latency p95 improved from {baseline_p95:.1f} ms to {current_p95:.1f} ms"
+        )
+
+    current_modes = {item["category"]: item["count"] for item in current.get("failure_modes", [])}
+    baseline_modes = {item["category"]: item["count"] for item in baseline.get("failure_modes", [])}
+    for category in sorted(set(current_modes) | set(baseline_modes)):
+        current_count = current_modes.get(category, 0)
+        baseline_count = baseline_modes.get(category, 0)
+        if current_count > baseline_count:
+            regressions.append(
+                f"failure mode {category} increased from {baseline_count} to {current_count}"
+            )
+        elif baseline_count > current_count:
+            improvements.append(
+                f"failure mode {category} dropped from {baseline_count} to {current_count}"
+            )
+
+    if regressions:
+        status = "regressed"
+    elif improvements:
+        status = "improved"
+    else:
+        status = "steady"
+
+    return {
+        "status": status,
+        "baseline_scenario": baseline.get("scenario"),
+        "baseline_summary": baseline_summary,
+        "regressions": regressions,
+        "improvements": improvements,
+    }
+
+
 def format_summary(report: dict[str, Any]) -> str:
     summary = report["summary"]
     lines = [
@@ -230,6 +317,17 @@ def format_summary(report: dict[str, Any]) -> str:
     ]
     if "budget_passed" in summary:
         lines.append(f"budget_passed: {summary['budget_passed']}")
+    comparison = report.get("comparison")
+    if comparison:
+        lines.append(f"baseline_status: {comparison['status']}")
+        if comparison.get("regressions"):
+            lines.append("baseline_regressions:")
+            for item in comparison["regressions"]:
+                lines.append(f"- {item}")
+        if comparison.get("improvements"):
+            lines.append("baseline_improvements:")
+            for item in comparison["improvements"]:
+                lines.append(f"- {item}")
     if report.get("failure_modes"):
         lines.append("failure_modes:")
         for failure_mode in report["failure_modes"]:
@@ -277,8 +375,18 @@ def run(argv: list[str] | None = None) -> int:
     if args.transport == "streamable-http" and not args.url:
         print("missing --url for streamable-http transport", file=sys.stderr)
         return 2
+    if args.fail_on_regression and not args.baseline:
+        print("missing --baseline for --fail-on-regression", file=sys.stderr)
+        return 2
 
     scenario = load_scenario(Path(args.scenario))
+    baseline_report: dict[str, Any] | None = None
+    if args.baseline:
+        try:
+            baseline_report = load_report(Path(args.baseline))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"failed to load baseline report: {exc}", file=sys.stderr)
+            return 2
     if args.transport == "stdio":
         client: BaseMcpClient = StdioMcpClient(command=command, timeout=args.timeout)
     else:
@@ -473,6 +581,8 @@ def run(argv: list[str] | None = None) -> int:
         "errors": errors,
         "violations": violations,
     }
+    if baseline_report is not None:
+        report["comparison"] = compare_reports(report, baseline_report)
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
@@ -480,6 +590,9 @@ def run(argv: list[str] | None = None) -> int:
     print(format_summary(report))
     strict_failures = violations if reliability else errors
     if args.strict and strict_failures:
+        return 1
+    comparison = report.get("comparison")
+    if args.fail_on_regression and comparison and comparison["status"] == "regressed":
         return 1
     return 0
 

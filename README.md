@@ -19,6 +19,7 @@ The first release is intentionally small:
 - per-tool reliability aggregates
 - failure-mode classification
 - grouped failure-pattern reporting
+- baseline report comparison for regression checks
 - readable terminal summary
 - JSON report output
 
@@ -38,6 +39,10 @@ It is trying to answer a narrower question well:
 
 > "If I replay the calls that matter, does this server stay reliable enough for my budget?"
 
+And now:
+
+> "Did this run get worse than the last known-good smoke report?"
+
 ## Quickstart
 
 ```bash
@@ -50,6 +55,26 @@ PYTHONPATH=src python3 -m mcp_smoke.cli \
   --json-out /tmp/mcp-smoke-report.json \
   -- python3 examples/echo_server.py
 ```
+
+### Compare against a baseline
+
+Point `mcp-smoke` at a previous JSON report to see whether reliability improved, stayed steady, or regressed:
+
+```bash
+PYTHONPATH=src python3 -m mcp_smoke.cli \
+  --scenario examples/flaky_budget_pass.json \
+  --repeat 4 \
+  --baseline /tmp/last-known-good.json \
+  --fail-on-regression \
+  --json-out /tmp/mcp-smoke-report.json \
+  -- python3 examples/flaky_server.py
+```
+
+This keeps the tool narrow:
+
+- it compares reliability verdicts and summary metrics from prior smoke reports
+- it does not record or replay raw MCP traffic
+- it can fail CI only when a real regression against the baseline is detected
 
 ### Remote `streamable-http`
 
@@ -143,6 +168,8 @@ The JSON report contains:
 - `failure_modes[]`
 - `tools.<tool>.success_rate`
 - `failure_patterns[]`
+- `comparison.status` when `--baseline` is used
+- `comparison.regressions[]` / `comparison.improvements[]`
 - per-call results
 - error list
 
@@ -157,6 +184,7 @@ Current failure-mode categories include:
 ## Roadmap
 
 - scenario ergonomics for more real-world reliability checks
+- per-tool baseline diffs when repeated runs show clear demand
 - fuller remote transport coverage only if clear demand shows up
 - packaged GitHub Action wrapper after the reliability thesis is sharper
 

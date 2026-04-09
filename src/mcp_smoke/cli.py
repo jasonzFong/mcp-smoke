@@ -232,6 +232,103 @@ def verdict_for(success_rate: float, hard_failures: int) -> str:
     return "untrusted"
 
 
+def empty_tool_stats() -> dict[str, Any]:
+    return {
+        "total_calls": 0,
+        "successful_calls": 0,
+        "success_rate": 0.0,
+        "latency_p50_ms": 0.0,
+        "latency_p95_ms": 0.0,
+        "failure_modes": [],
+    }
+
+
+def compare_failure_modes(
+    current_modes: list[dict[str, Any]], baseline_modes: list[dict[str, Any]]
+) -> tuple[list[str], list[str]]:
+    regressions: list[str] = []
+    improvements: list[str] = []
+    current_counts = {item["category"]: item["count"] for item in current_modes}
+    baseline_counts = {item["category"]: item["count"] for item in baseline_modes}
+    for category in sorted(set(current_counts) | set(baseline_counts)):
+        current_count = current_counts.get(category, 0)
+        baseline_count = baseline_counts.get(category, 0)
+        if current_count > baseline_count:
+            regressions.append(
+                f"failure mode {category} increased from {baseline_count} to {current_count}"
+            )
+        elif baseline_count > current_count:
+            improvements.append(
+                f"failure mode {category} dropped from {baseline_count} to {current_count}"
+            )
+    return regressions, improvements
+
+
+def compare_tool_stats(
+    current_tools: dict[str, dict[str, Any]], baseline_tools: dict[str, dict[str, Any]]
+) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
+    tool_diffs: dict[str, dict[str, Any]] = {}
+    regressions: list[str] = []
+    improvements: list[str] = []
+
+    for tool_name in sorted(set(current_tools) | set(baseline_tools)):
+        current_stats = current_tools.get(tool_name)
+        baseline_stats = baseline_tools.get(tool_name)
+        tool_regressions: list[str] = []
+        tool_improvements: list[str] = []
+
+        if current_stats is None:
+            tool_regressions.append("tool disappeared from current report")
+        elif baseline_stats is None:
+            tool_improvements.append("tool is new in current report")
+        else:
+            current_success_rate = float(current_stats.get("success_rate", 0.0))
+            baseline_success_rate = float(baseline_stats.get("success_rate", 0.0))
+            if current_success_rate + SUCCESS_RATE_EPSILON < baseline_success_rate:
+                tool_regressions.append(
+                    f"success rate regressed from {baseline_success_rate:.2f} to {current_success_rate:.2f}"
+                )
+            elif baseline_success_rate + SUCCESS_RATE_EPSILON < current_success_rate:
+                tool_improvements.append(
+                    f"success rate improved from {baseline_success_rate:.2f} to {current_success_rate:.2f}"
+                )
+
+            current_p95 = float(current_stats.get("latency_p95_ms", 0.0))
+            baseline_p95 = float(baseline_stats.get("latency_p95_ms", 0.0))
+            if current_p95 > baseline_p95 + LATENCY_REGRESSION_GRACE_MS:
+                tool_regressions.append(
+                    f"latency p95 regressed from {baseline_p95:.1f} ms to {current_p95:.1f} ms"
+                )
+            elif baseline_p95 > current_p95 + LATENCY_REGRESSION_GRACE_MS:
+                tool_improvements.append(
+                    f"latency p95 improved from {baseline_p95:.1f} ms to {current_p95:.1f} ms"
+                )
+
+            failure_mode_regressions, failure_mode_improvements = compare_failure_modes(
+                current_stats.get("failure_modes", []),
+                baseline_stats.get("failure_modes", []),
+            )
+            tool_regressions.extend(failure_mode_regressions)
+            tool_improvements.extend(failure_mode_improvements)
+
+        if tool_regressions:
+            status = "regressed"
+        elif tool_improvements:
+            status = "improved"
+        else:
+            status = "steady"
+
+        tool_diffs[tool_name] = {
+            "status": status,
+            "regressions": tool_regressions,
+            "improvements": tool_improvements,
+        }
+        regressions.extend(f"tool {tool_name}: {item}" for item in tool_regressions)
+        improvements.extend(f"tool {tool_name}: {item}" for item in tool_improvements)
+
+    return tool_diffs, regressions, improvements
+
+
 def compare_reports(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
     current_summary = current["summary"]
     baseline_summary = baseline.get("summary", {})
@@ -276,19 +373,19 @@ def compare_reports(current: dict[str, Any], baseline: dict[str, Any]) -> dict[s
             f"latency p95 improved from {baseline_p95:.1f} ms to {current_p95:.1f} ms"
         )
 
-    current_modes = {item["category"]: item["count"] for item in current.get("failure_modes", [])}
-    baseline_modes = {item["category"]: item["count"] for item in baseline.get("failure_modes", [])}
-    for category in sorted(set(current_modes) | set(baseline_modes)):
-        current_count = current_modes.get(category, 0)
-        baseline_count = baseline_modes.get(category, 0)
-        if current_count > baseline_count:
-            regressions.append(
-                f"failure mode {category} increased from {baseline_count} to {current_count}"
-            )
-        elif baseline_count > current_count:
-            improvements.append(
-                f"failure mode {category} dropped from {baseline_count} to {current_count}"
-            )
+    failure_mode_regressions, failure_mode_improvements = compare_failure_modes(
+        current.get("failure_modes", []),
+        baseline.get("failure_modes", []),
+    )
+    regressions.extend(failure_mode_regressions)
+    improvements.extend(failure_mode_improvements)
+
+    tool_diffs, tool_regressions, tool_improvements = compare_tool_stats(
+        current.get("tools", {}),
+        baseline.get("tools", {}),
+    )
+    regressions.extend(tool_regressions)
+    improvements.extend(tool_improvements)
 
     if regressions:
         status = "regressed"
@@ -303,6 +400,7 @@ def compare_reports(current: dict[str, Any], baseline: dict[str, Any]) -> dict[s
         "baseline_summary": baseline_summary,
         "regressions": regressions,
         "improvements": improvements,
+        "tool_diffs": tool_diffs,
     }
 
 
@@ -328,6 +426,19 @@ def format_summary(report: dict[str, Any]) -> str:
             lines.append("baseline_improvements:")
             for item in comparison["improvements"]:
                 lines.append(f"- {item}")
+        changed_tool_diffs = {
+            tool_name: diff
+            for tool_name, diff in comparison.get("tool_diffs", {}).items()
+            if diff["status"] != "steady"
+        }
+        if changed_tool_diffs:
+            lines.append("baseline_tools:")
+            for tool_name, diff in changed_tool_diffs.items():
+                lines.append(f"- {tool_name}: {diff['status']}")
+                for item in diff["regressions"]:
+                    lines.append(f"  regression: {item}")
+                for item in diff["improvements"]:
+                    lines.append(f"  improvement: {item}")
     if report.get("failure_modes"):
         lines.append("failure_modes:")
         for failure_mode in report["failure_modes"]:
@@ -402,7 +513,7 @@ def run(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     violations: list[str] = []
-    failure_events: list[dict[str, str]] = []
+    failure_events: list[dict[str, str | None]] = []
     successful_calls = 0
     total_calls = 0
 
@@ -422,7 +533,7 @@ def run(argv: list[str] | None = None) -> int:
             category = classify_exception(exc, "initialize")
             message = str(exc)
             errors.append(message)
-            failure_events.append({"category": category, "message": message})
+            failure_events.append({"category": category, "message": message, "tool": None})
             tools_result = {"tools": []}
         else:
             tools = tools_result.get("tools", [])
@@ -437,6 +548,7 @@ def run(argv: list[str] | None = None) -> int:
                         {
                             "category": "missing_expected_tool",
                             "message": message,
+                            "tool": expected_tool,
                         }
                     )
 
@@ -468,6 +580,7 @@ def run(argv: list[str] | None = None) -> int:
                                     {
                                         "category": "expectation_mismatch",
                                         "message": f"{call['tool']}: {detail}",
+                                        "tool": call["tool"],
                                     }
                                 )
                             else:
@@ -481,6 +594,7 @@ def run(argv: list[str] | None = None) -> int:
                             {
                                 "category": classify_exception(exc, "tools/call"),
                                 "message": f"{call['tool']}: {detail}",
+                                "tool": call["tool"],
                             }
                         )
                     latency_ms = (time.perf_counter() - started_at) * 1000
@@ -517,6 +631,7 @@ def run(argv: list[str] | None = None) -> int:
             "success_rate": 0.0 if tool_total == 0 else tool_successes / tool_total,
             "latency_p50_ms": statistics.median(tool_latencies) if tool_latencies else 0.0,
             "latency_p95_ms": percentile(tool_latencies, 0.95),
+            "failure_modes": [],
         }
 
     failure_pattern_counts: dict[tuple[str, str], int] = {}
@@ -546,6 +661,27 @@ def run(argv: list[str] | None = None) -> int:
             key=lambda item: (-item[1], item[0]),
         )
     ]
+
+    tool_failure_mode_counts: dict[str, dict[str, int]] = {}
+    for item in failure_events:
+        tool_name = item.get("tool")
+        if not tool_name:
+            continue
+        category = item["category"]
+        tool_failure_mode_counts.setdefault(tool_name, {})
+        tool_failure_mode_counts[tool_name][category] = (
+            tool_failure_mode_counts[tool_name].get(category, 0) + 1
+        )
+
+    for tool_name, mode_counts in tool_failure_mode_counts.items():
+        tool_stats.setdefault(tool_name, empty_tool_stats())
+        tool_stats[tool_name]["failure_modes"] = [
+            {"category": category, "count": count}
+            for category, count in sorted(
+                mode_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
 
     reliability = scenario.get("reliability", {})
     if "min_success_rate" in reliability and success_rate < reliability["min_success_rate"]:

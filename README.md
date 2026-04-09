@@ -20,6 +20,7 @@ The first release is intentionally small:
 - failure-mode classification
 - grouped failure-pattern reporting
 - baseline report comparison for regression checks
+- per-tool baseline diffs for actionable regression diagnosis
 - readable terminal summary
 - JSON report output
 
@@ -73,6 +74,7 @@ PYTHONPATH=src python3 -m mcp_smoke.cli \
 This keeps the tool narrow:
 
 - it compares reliability verdicts and summary metrics from prior smoke reports
+- it also points to which tool regressed or improved on success rate, latency, or failure modes
 - it does not record or replay raw MCP traffic
 - it can fail CI only when a real regression against the baseline is detected
 
@@ -152,6 +154,7 @@ Terminal output includes:
 - verdict
 - success rate
 - budget pass/fail status
+- baseline tool-level regressions and improvements when `--baseline` is used
 - failure-mode summary
 - overall and per-tool call counts
 - overall and per-tool latency summaries
@@ -167,9 +170,13 @@ The JSON report contains:
 - `summary.latency_p95_ms`
 - `failure_modes[]`
 - `tools.<tool>.success_rate`
+- `tools.<tool>.failure_modes[]`
 - `failure_patterns[]`
 - `comparison.status` when `--baseline` is used
 - `comparison.regressions[]` / `comparison.improvements[]`
+- `comparison.tool_diffs.<tool>.status`
+- `comparison.tool_diffs.<tool>.regressions[]`
+- `comparison.tool_diffs.<tool>.improvements[]`
 - per-call results
 - error list
 
@@ -184,7 +191,6 @@ Current failure-mode categories include:
 ## Roadmap
 
 - scenario ergonomics for more real-world reliability checks
-- per-tool baseline diffs when repeated runs show clear demand
 - fuller remote transport coverage only if clear demand shows up
 - packaged GitHub Action wrapper after the reliability thesis is sharper
 

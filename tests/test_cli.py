@@ -554,6 +554,145 @@ class CliTests(unittest.TestCase):
         self.assertIn("baseline_status: improved", result.stdout)
         self.assertIn("verdict improved", result.stdout)
 
+    def test_baseline_per_tool_regression_is_reported(self) -> None:
+        baseline_path = self.write_baseline_report(
+            {
+                "scenario": "known-good",
+                "summary": {
+                    "verdict": "trustworthy",
+                    "success_rate": 1.0,
+                    "total_calls": 4,
+                    "successful_calls": 4,
+                    "latency_p50_ms": 8.0,
+                    "latency_p95_ms": 12.0,
+                    "budget_passed": True,
+                },
+                "tools": {
+                    "flaky_echo": {
+                        "total_calls": 4,
+                        "successful_calls": 4,
+                        "success_rate": 1.0,
+                        "latency_p50_ms": 8.0,
+                        "latency_p95_ms": 12.0,
+                        "failure_modes": [],
+                    }
+                },
+                "failure_modes": [],
+            }
+        )
+
+        report_dir = Path(tempfile.mkdtemp())
+        report_path = report_dir / "report.json"
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp_smoke.cli",
+            "--scenario",
+            str(ROOT / "examples" / "flaky_budget_pass.json"),
+            "--json-out",
+            str(report_path),
+            "--repeat",
+            "4",
+            "--baseline",
+            str(baseline_path),
+            "--",
+            sys.executable,
+            str(ROOT / "examples" / "flaky_server.py"),
+        ]
+        env = dict(PYTHONPATH=PYTHONPATH, **{})
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        report = json.loads(report_path.read_text())
+        tool_diff = report["comparison"]["tool_diffs"]["flaky_echo"]
+        self.assertEqual(tool_diff["status"], "regressed")
+        self.assertTrue(
+            any("success rate regressed" in item for item in tool_diff["regressions"]),
+            msg=tool_diff,
+        )
+        self.assertTrue(
+            any("failure mode tool_call_failure increased" in item for item in tool_diff["regressions"]),
+            msg=tool_diff,
+        )
+        self.assertIn("baseline_tools:", result.stdout)
+        self.assertIn("flaky_echo: regressed", result.stdout)
+
+    def test_baseline_per_tool_improvement_is_reported(self) -> None:
+        baseline_path = self.write_baseline_report(
+            {
+                "scenario": "known-bad",
+                "summary": {
+                    "verdict": "untrusted",
+                    "success_rate": 0.5,
+                    "total_calls": 2,
+                    "successful_calls": 1,
+                    "latency_p50_ms": 30.0,
+                    "latency_p95_ms": 90.0,
+                    "budget_passed": False,
+                },
+                "tools": {
+                    "echo": {
+                        "total_calls": 2,
+                        "successful_calls": 1,
+                        "success_rate": 0.5,
+                        "latency_p50_ms": 30.0,
+                        "latency_p95_ms": 90.0,
+                        "failure_modes": [{"category": "timeout", "count": 1}],
+                    }
+                },
+                "failure_modes": [{"category": "timeout", "count": 1}],
+            }
+        )
+
+        report_dir = Path(tempfile.mkdtemp())
+        report_path = report_dir / "report.json"
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp_smoke.cli",
+            "--scenario",
+            str(ROOT / "examples" / "echo_scenario.json"),
+            "--json-out",
+            str(report_path),
+            "--baseline",
+            str(baseline_path),
+            "--strict",
+            "--",
+            sys.executable,
+            str(ROOT / "examples" / "echo_server.py"),
+        ]
+        env = dict(PYTHONPATH=PYTHONPATH, **{})
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        report = json.loads(report_path.read_text())
+        tool_diff = report["comparison"]["tool_diffs"]["echo"]
+        self.assertEqual(tool_diff["status"], "improved")
+        self.assertTrue(
+            any("success rate improved" in item for item in tool_diff["improvements"]),
+            msg=tool_diff,
+        )
+        self.assertTrue(
+            any("failure mode timeout dropped" in item for item in tool_diff["improvements"]),
+            msg=tool_diff,
+        )
+        self.assertIn("baseline_tools:", result.stdout)
+        self.assertIn("echo: improved", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
